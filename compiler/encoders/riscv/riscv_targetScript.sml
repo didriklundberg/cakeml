@@ -15,11 +15,19 @@ End
 
 (* --- Valid RISC-V states --- *)
 
-(* We assume virtual memory is turned off and a 64-bit architecture (RV64I) *)
+(* We assume a 64-bit architecture (RV64I) in machine mode with interrupts
+   disabled and with loads and stores made at machine privilege (mstatus.MPRV
+   clear), so that addresses are not translated. Physical memory protection
+   must not restrict machine mode: no PMP entry is locked, and every entry is
+   OFF or NAPOT, so that no 8-byte access matches a PMP region only in part. *)
 Definition riscv_ok_def:
    riscv_ok ms <=>
-   ((ms.c_MCSR ms.procID).mstatus.VM = 0w) /\
-   ((ms.c_MCSR ms.procID).mcpuid.ArchBase = 2w) /\
+   (ms.c_privilege ms.procID = 3w) /\
+   ~(ms.c_MCSR ms.procID).mstatus.MIE /\
+   ~(ms.c_MCSR ms.procID).mstatus.MPRV /\
+   ((ms.c_MCSR ms.procID).misa.MXL = 2w) /\
+   pmp_unlocked (ms.c_MCSR ms.procID) /\
+   pmp_off_or_napot (ms.c_MCSR ms.procID) /\
    (ms.c_NextFetch ms.procID = NONE) /\
    (ms.exception = NoException) /\ aligned 2 (ms.c_PC ms.procID)
 End
@@ -324,8 +332,12 @@ End
 
 Definition riscv_proj_def:
    riscv_proj d s =
-   ((s.c_MCSR s.procID).mstatus.VM,
-    (s.c_MCSR s.procID).mcpuid.ArchBase,
+   (s.c_privilege s.procID,
+    (s.c_MCSR s.procID).mstatus.MIE,
+    (s.c_MCSR s.procID).mstatus.MPRV,
+    (s.c_MCSR s.procID).misa.MXL,
+    (s.c_MCSR s.procID).pmpcfg0,
+    (s.c_MCSR s.procID).pmpcfg2,
     s.c_NextFetch s.procID,
     s.exception,
     s.c_gpr s.procID,

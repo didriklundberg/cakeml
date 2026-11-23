@@ -134,8 +134,10 @@ End
 
 Definition san_MCSR_def:
   san_MCSR = (san_procID =+
-      <|mstatus := <| VM := 0w |>;
-      mcpuid := <|ArchBase := 2w |> |>) ARB
+      <|mstatus := <| MIE := F; MPRV := F |>;
+      misa := <| MXL := 2w |>;
+      pmpcfg0 := 0w;
+      pmpcfg2 := 0w |>) ARB
 End
 
 Definition san_init_machine_state_def:
@@ -145,6 +147,7 @@ Definition san_init_machine_state_def:
       procID := san_procID;
       MEM8 := word_EL san_program 0w;
       c_MCSR := san_MCSR;
+      c_privilege := (san_procID =+ 3w) ARB;
       exception := NoException;
       c_NextFetch := (san_procID =+ NONE) ARB|>
 End
@@ -153,11 +156,6 @@ Definition san_result_def:
   san_result n =
   evaluate san_config san_init_ffi_state n san_init_machine_state
 End
-
-val riscv_inst_defs = DB.match ["riscv"] ``_``
-  |> filter (fn ((_,name),(_,cl,_)) =>
-       cl = Def andalso String.isPrefix "dfn'" name)
-  |> map (fn (_, (th,_,_)) => th);
 
 val _ = computeLib.add_funs
   [Encode_def,Itype_def,Stype_def,UJtype_def,opc_def,word_concat_def,v2w_def];
@@ -178,32 +176,33 @@ fun encoded_bytes_in_mem_tac inst offset =
   simp[];
 
 val riscv_ok_tac = simp[
-  EVAL ``ffi_offset``, riscv_ok_def,aligned_w2n,APPLY_UPDATE_THM];
+  EVAL ``ffi_offset``, riscv_ok_def,riscv_stepTheory.pmp_unlocked_def,
+  riscv_stepTheory.pmp_off_or_napot_def,aligned_w2n,APPLY_UPDATE_THM];
 
-val decode_conv =
-  SIMP_CONV (srw_ss()) [Decode_def,boolify32_def,LET_DEF] THENC
-  EVAL;
-
-fun pattern_conv pat conv_f = DEPTH_CONV
-  (fn tm =>
-    if is_comb tm andalso is_const(fst(dest_comb tm)) andalso
-      dest_const(fst(dest_comb tm)) = dest_const pat
-    then conv_f tm
-    else ALL_CONV tm);
-
-val next_state_conv = EVAL THENC
-  SIMP_CONV (srw_ss())
-    [rawReadInst_def,translateAddr_def,vmType_def,MCSR_def,
-     APPLY_UPDATE_THM,PC_def,LET_DEF,word_EL_def,boolify8_def] THENC
-  SIMP_CONV (srw_ss())
-    [write'Skip_def,word_EL_def,word_concat_def] THENC
-  pattern_conv ``Decode`` decode_conv THENC
-  SIMP_CONV (srw_ss())
-    ([Run_def,GPR_def,write'GPR_def,write'gpr_def,LET_THM,branchTo_def,
-      write'NextFetch_def,asImm20_def,word_concat_def,PC_def,word_bit_def]
-      @ riscv_inst_defs) THENC
-  SIMP_CONV (srw_ss())
-    [NextFetch_def,write'PC_def,Skip_def,APPLY_UPDATE_THM,gpr_def,PC_def];
+(* Evaluates riscv_next on a concrete state: reads the four bytes of the
+   instruction at the pc, takes the step theorem of that instruction and
+   proves its hypotheses of the state by evaluation. *)
+fun next_state_conv tm =
+  let
+    val st = rand tm
+    val eval = rhs o concl o EVAL
+    val pc = eval ``(^st).c_PC (^st).procID``
+    fun byte i =
+      let
+        val b = eval ``(^st).MEM8 (^pc + n2w ^(numSyntax.term_of_int i))``
+        val s = Int.fmt StringCvt.HEX (wordsSyntax.uint_of_word b)
+      in
+        if String.size s < 2 then "0" ^ s else s
+      end
+    val th = riscv_stepLib.riscv_step_hex (String.concat (map byte [3,2,1,0]))
+    val th = INST [``s:riscv_state`` |-> st] th
+    val th = foldl (fn (h, th) => PROVE_HYP (EQT_ELIM (EVAL h)) th) th (hyp th)
+  in
+    (REWR_CONV riscv_next_def THENC RAND_CONV (REWR_CONV th) THENC
+     REWR_CONV optionTheory.THE_DEF THENC
+     SIMP_CONV (srw_ss()++bitstringLib.v2w_n2w_ss)
+       [Skip_def,APPLY_UPDATE_THM]) tm
+  end;
 
 val next_state_tac = qpat_abbrev_tac `_y = riscv_next _` \\
   pop_assum(assume_tac o (CONV_RULE (RAND_CONV (RHS_CONV next_state_conv)))) \\

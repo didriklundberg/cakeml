@@ -16,8 +16,16 @@ Theorem bytes_in_memory_thm[local]:
       target_state_rel riscv_target s state /\
       bytes_in_memory s.pc [a; b; c; d] s.mem s.mem_domain ==>
       (state.exception = NoException) /\
-      ((state.c_MCSR state.procID).mstatus.VM = 0w) /\
-      ((state.c_MCSR state.procID).mcpuid.ArchBase = 2w) /\
+      (state.c_privilege state.procID = 3w) /\
+      ~(state.c_MCSR state.procID).mstatus.MIE /\
+      ~(state.c_MCSR state.procID).mstatus.MPRV /\
+      ((state.c_MCSR state.procID).misa.MXL = 2w) /\
+      ((state.c_MCSR state.procID).pmpcfg0 && 0x8080808080808080w = 0w) /\
+      ((state.c_MCSR state.procID).pmpcfg2 && 0x8080808080808080w = 0w) /\
+      ((((state.c_MCSR state.procID).pmpcfg0 >>> 1) ??
+        (state.c_MCSR state.procID).pmpcfg0) && 0x0808080808080808w = 0w) /\
+      ((((state.c_MCSR state.procID).pmpcfg2 >>> 1) ??
+        (state.c_MCSR state.procID).pmpcfg2) && 0x0808080808080808w = 0w) /\
       (state.c_NextFetch state.procID = NONE) /\
       aligned 2 (state.c_PC state.procID) /\
       (state.MEM8 (state.c_PC state.procID) = a) /\
@@ -31,6 +39,8 @@ Theorem bytes_in_memory_thm[local]:
 Proof
   rw [asmPropsTheory.target_state_rel_def, riscv_target_def, riscv_config_def,
        riscv_ok_def, miscTheory.bytes_in_memory_def,
+       riscv_stepTheory.pmp_unlocked_def,
+       riscv_stepTheory.pmp_off_or_napot_def,
        alignmentTheory.aligned_extract, set_sepTheory.fun2set_eq]
    \\ fs []
 QED
@@ -227,6 +237,16 @@ Proof
   blastLib.BBLAST_TAC
 QED
 
+Theorem aligned_imp_word_bit[local]:
+  (!w : word64 c.
+     aligned 2 w ==> ~word_bit 1 (0xFFFFFFFFFFFFFFFEw && w) \/ c) /\
+  (!w : word64 c. aligned 2 w ==> ~word_bit 1 w \/ c) /\
+  (!w : word64. aligned 2 w ==> ~word_bit 0 w)
+Proof
+  rw [alignmentTheory.aligned_bitwise_and]
+  \\ blastLib.FULL_BBLAST_TAC
+QED
+
 local
    val bool1 = utilsLib.rhsc o blastLib.BBLAST_CONV o fcpSyntax.mk_fcp_index
    fun boolify n tm =
@@ -238,12 +258,24 @@ local
    val find_NextRISCV =
       dest_NextRISCV o List.hd o HolKernel.find_terms is_NextRISCV
    val s = ``s: riscv_state``
+   (* The step theorems assume that bit 0 of the pc is clear, and that bit 1
+      of the pc and of the target of a branch or jump is clear unless the C
+      extension is present. All of these follow from alignment to four
+      bytes, which is what replaces them as hypotheses here. *)
+   fun align_hyp (h, th) =
+     case Lib.get_first
+            (fn lem => Lib.total (Drule.PART_MATCH (snd o dest_imp) lem) h)
+            (Drule.CONJUNCTS aligned_imp_word_bit) of
+        SOME lem => Drule.PROVE_HYP (Drule.UNDISCH lem) th
+      | NONE => th
+   fun align_hyps th = List.foldl align_hyp th (Thm.hyp th)
    fun post_process th =
      th |> REWRITE_RULE [word_bit_0_lemmas]
    fun step the_state l =
       let
          val v = listSyntax.mk_list (bytes l, Type.bool)
          val thm = Thm.INST [s |-> the_state] (riscv_stepLib.riscv_step v)
+                   |> align_hyps
       in
          (Drule.DISCH_ALL thm |> post_process,
           optionSyntax.dest_some (boolSyntax.rand (Thm.concl thm)))
@@ -251,6 +283,21 @@ local
    val ms = ``ms: riscv_state``
    fun new_state_var l =
      Term.variant (List.concat (List.map Term.free_vars l)) ms
+   (* The target of a branch or jump is aligned because the pc, the offset
+      and the register contents computed by the instructions so far are. *)
+   fun target_aligned_tac (asl, g) =
+     let
+       val abbrs =
+         List.mapPartial (Lib.total markerSyntax.dest_abbrev) asl
+         |> List.filter (fn (_, tm) => type_of tm = ``:riscv_state``)
+         |> List.map (fn (v, _) => markerLib.Abbr [QUOTE v])
+     in
+       (rpt (qpat_x_assum `aligned 2 _` mp_tac)
+        \\ asm_simp_tac (srw_ss()++bitstringLib.v2w_n2w_ss)
+             (combinTheory.APPLY_UPDATE_THM :: alignmentTheory.aligned_extract
+              :: abbrs)
+        \\ blastLib.BBLAST_TAC) (asl, g)
+     end
    fun env (t, tm) =
      let
        (*
@@ -266,10 +313,17 @@ local
            `(!a. a IN s1.mem_domain ==> ((^etm).MEM8 a = ms.MEM8 a)) /\
             ((^etm).exception = ms.exception) /\
             ((^etm).c_NextFetch (^etm).procID = ms.c_NextFetch ms.procID) /\
-            (((^etm).c_MCSR (^etm).procID).mstatus.VM =
-             (ms.c_MCSR ms.procID).mstatus.VM) /\
-            (((^etm).c_MCSR (^etm).procID).mcpuid.ArchBase =
-             (ms.c_MCSR ms.procID).mcpuid.ArchBase) /\
+            ((^etm).c_privilege (^etm).procID = ms.c_privilege ms.procID) /\
+            (((^etm).c_MCSR (^etm).procID).mstatus.MIE =
+             (ms.c_MCSR ms.procID).mstatus.MIE) /\
+            (((^etm).c_MCSR (^etm).procID).mstatus.MPRV =
+             (ms.c_MCSR ms.procID).mstatus.MPRV) /\
+            (((^etm).c_MCSR (^etm).procID).misa.MXL =
+             (ms.c_MCSR ms.procID).misa.MXL) /\
+            (((^etm).c_MCSR (^etm).procID).pmpcfg0 =
+             (ms.c_MCSR ms.procID).pmpcfg0) /\
+            (((^etm).c_MCSR (^etm).procID).pmpcfg2 =
+             (ms.c_MCSR ms.procID).pmpcfg2) /\
             ((^etm).c_PC (^etm).procID = ^pc)`
             >| [
               asm_simp_tac (srw_ss()++bitstringLib.v2w_n2w_ss)
@@ -309,6 +363,13 @@ in
          \\ SUBST1_TAC (Thm.SPEC the_state riscv_next_def)
          \\ byte_eq_tac
          \\ NO_STRIP_REV_FULL_SIMP_TAC (srw_ss()++boolSimps.LET_ss) [lem1, lem5]
+         \\ TRY (qpat_x_assum
+                   `aligned 2 (_ : word64) ==> (NextRISCV _ = _)`
+                   (fn th => SUBGOAL_THEN (lhand (concl th))
+                               (fn lth => assume_tac (MP th lth))
+                             >- target_aligned_tac)
+                 \\ NO_STRIP_REV_FULL_SIMP_TAC (srw_ss()++boolSimps.LET_ss)
+                      [lem1, lem5])
       end
       handle List.Empty => FAIL_TAC "next_state_tac: empty") (asl, g)
 end
@@ -340,7 +401,9 @@ in
     in
       (
        NO_STRIP_FULL_SIMP_TAC (srw_ss())
-         [riscv_ok_def, asmPropsTheory.sym_target_state_rel, riscv_target_def,
+         [riscv_ok_def, riscv_stepTheory.pmp_unlocked_def,
+          riscv_stepTheory.pmp_off_or_napot_def,
+          asmPropsTheory.sym_target_state_rel, riscv_target_def,
           riscv_config, lem2, cond_rand_thms,
           alignmentTheory.aligned_numeric, set_sepTheory.fun2set_eq]
        \\ (if not (List.null l) andalso
@@ -513,6 +576,8 @@ Theorem riscv_target_ok[local]:
 Proof
   rw ([asmPropsTheory.target_ok_def, asmPropsTheory.target_state_rel_def,
         riscv_proj_def, riscv_target_def, riscv_config, riscv_ok_def,
+        riscv_stepTheory.pmp_unlocked_def,
+        riscv_stepTheory.pmp_off_or_napot_def,
         set_sepTheory.fun2set_eq, riscv_encoding] @ enc_ok_rwts)
    >| [Cases_on `-0x100000w <= (i2w w1 : word64) /\ (i2w w1 : word64) <= 0xFFFFFw`
        \\ Cases_on `-0x100000w <= (i2w w2 : word64) /\ (i2w w2 : word64) <= 0xFFFFFw`,
@@ -702,7 +767,7 @@ Resume riscv_encoder_correct[IDiv]:
   \\ NTAC 2 strip_tac
   \\ qpat_assum `!i st. _ /\ _` (fn th =>
        assume_tac (GENL (fst (strip_forall (concl th)))
-         (CONJUNCT1 (funpow 5 CONJUNCT2 (SPEC_ALL th)))))
+         (CONJUNCT1 (funpow 9 CONJUNCT2 (SPEC_ALL th)))))
   \\ qpat_assum `bytes_in_memory _ _ _ _` (fn bytes =>
     qpat_assum `!i st a. a IN s1.mem_domain ==> _`
       (assume_tac o MATCH_MP bytes_in_memory_IMP_all_pcs_MEM8 o CONJ bytes))
@@ -1099,8 +1164,15 @@ Resume riscv_encoder_correct[Call]:
 QED
 
 Resume riscv_encoder_correct[JumpReg]:
-  print_tac "JumpReg"
-      \\ next_tac
+  qmatch_goalsub_rename_tac `riscv_enc (JumpReg r)`
+  (* the target of the jump is aligned *)
+  \\ `aligned 2 (ms.c_gpr ms.procID (n2w r))` by
+       (qpat_assum `target_state_rel riscv_target s1 ms`
+          (assume_tac o Q.SPEC `r` o MATCH_MP riscv_reg_read_64)
+        \\ fs (asmTheory.asm_ok_def :: asmLib.asm_rwts)
+        \\ rfs [])
+  \\ print_tac "JumpReg"
+  \\ next_tac
 QED
 
 Resume riscv_encoder_correct[Loc]:
